@@ -1,0 +1,188 @@
+{# ======================================================== #}
+{# Incremental Fact Node - Run Template (with Multi-Source) #}
+{# ======================================================== #}
+
+{# Run tests before insertion #}
+{% for test in node.tests if config.testsEnabled %}
+    {% if test.runOrder == 'Before' %}
+        {{ test_stage(test.name, test.continueOnFailure) }}
+        {{ test.templateString }}
+    {% endif %}
+{% endfor %}
+
+{# Pre-SQL #}
+{% if config.preSQL %}
+    {{ stage('Pre-SQL') }}
+    {{ config.preSQL }}
+{% endif %}
+
+{% set load_date_col = config.loadDateColumn.name if config.loadDateColumn.name is defined else config.loadDateColumn %}
+{% set has_business_key = columns | selectattr("isBusinessKey") | list | length > 0 %}
+
+{# ========================================================= #}
+{# INCREMENTAL LOAD (MERGE or INSERT)                       #}
+{# ========================================================= #}
+
+{% if config.enableIncremental and has_business_key %}
+    {{ stage('MERGE Incremental Data') }}
+    MERGE INTO {{ ref_no_link(node.location.name, node.name) }} "TGT"
+    USING (
+        SELECT * EXCLUDE (rn) FROM (
+            SELECT *
+            FROM (
+                {% for source in sources %}
+                    SELECT
+                        {% for col in source.columns %}
+                            {{ get_source_transform(col) }} AS "{{ col.name }}"
+                            {%- if not loop.last %}, {% endif %}
+                        {% endfor %}
+                        ,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY {% for col in columns if col.isBusinessKey %}
+                                {{ get_source_transform(source.columns | selectattr("name", "equalto", col.name) | first) }}
+                                {%- if not loop.last -%}, {% endif %}
+                            {% endfor %}
+                            ORDER BY {{ get_source_transform(source.columns | selectattr("name", "equalto", load_date_col) | first) }} DESC
+                        ) AS rn
+                    {{ source.join }}
+                    {% if config.insertStrategy in ['UNION', 'UNION ALL'] and not loop.last %}
+                        {{ config.insertStrategy }}
+                    {% endif %}
+                {% endfor %}
+            ) branch_src
+            WHERE branch_src.rn = 1
+        ) combined_src
+        {% if not config.isInitialLoad %}
+            WHERE combined_src."{{ load_date_col }}" >= DATEADD(day, -{{ config.lookbackDays }}, CURRENT_DATE)
+        {% endif %}
+        {% if has_business_key %}
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY {% for col in columns if col.isBusinessKey %}
+                    combined_src."{{ col.name }}"
+                    {%- if not loop.last %}, {% endif %}
+                {% endfor %}
+                ORDER BY combined_src."{{ load_date_col }}" DESC
+            ) = 1
+        {% endif %}
+    ) "SRC"
+    ON {% for col in columns if col.isBusinessKey %}
+        {% if not loop.first %}AND {% endif %}
+        "SRC"."{{ col.name }}" = "TGT"."{{ col.name }}"
+    {% endfor %}
+    WHEN MATCHED THEN UPDATE SET
+        {%- for col in columns if not col.isBusinessKey %}
+            "TGT"."{{ col.name }}" = "SRC"."{{ col.name }}"
+            {% if not loop.last %}, {% endif %}
+        {% endfor %}
+    WHEN NOT MATCHED THEN INSERT (
+        {%- for col in columns %}
+            "{{ col.name }}"
+            {% if not loop.last %}, {% endif %}
+        {% endfor -%}
+    )
+    VALUES (
+        {%- for col in columns %}
+            "SRC"."{{ col.name }}"
+            {% if not loop.last %}, {% endif %}
+        {% endfor -%}
+    );
+
+{% elif config.enableIncremental %}
+    {{ stage('Insert Incremental (No Business Key)') }}
+    INSERT INTO {{ ref_no_link(node.location.name, node.name) }}
+    (
+        {% for col in columns %}
+            "{{ col.name }}"
+            {%- if not loop.last %}, {% endif %}
+        {% endfor %}
+    )
+    SELECT *
+    FROM (
+        SELECT *
+        FROM (
+            {% for source in sources %}
+                SELECT
+                    {% for col in source.columns %}
+                        {{ get_source_transform(col) }} AS "{{ col.name }}"
+                        {%- if not loop.last %}, {% endif %}
+                    {% endfor %}
+                {{ source.join }}
+                {% if config.insertStrategy in ['UNION', 'UNION ALL'] and not loop.last %}
+                    {{ config.insertStrategy }}
+                {% endif %}
+            {% endfor %}
+        ) branch_src
+        {% if has_business_key %}
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY {% for col in columns if col.isBusinessKey %}
+                    branch_src."{{ col.name }}"
+                    {%- if not loop.last %}, {% endif %}
+                {% endfor %}
+                ORDER BY branch_src."{{ load_date_col }}" DESC
+            ) = 1
+        {% endif %}
+    ) src
+    WHERE src."{{ load_date_col }}" >= DATEADD(day, -{{ config.lookbackDays }}, CURRENT_DATE);
+
+{% else %}
+    {{ stage('Truncate Table') }}
+    TRUNCATE TABLE {{ ref_no_link(node.location.name, node.name) }};
+
+    {{ stage('Insert Full Data') }}
+    INSERT INTO {{ ref_no_link(node.location.name, node.name) }}
+    (
+        {% for col in columns %}
+            "{{ col.name }}"
+            {%- if not loop.last %}, {% endif %}
+        {% endfor %}
+    )
+    {% if has_business_key %}
+        SELECT * EXCLUDE (rn)
+        FROM (
+            SELECT *
+            FROM (
+                {% for source in sources %}
+                    SELECT
+                        {% for col in source.columns %}
+                            {{ get_source_transform(col) }} AS "{{ col.name }}"
+                            {%- if not loop.last %}, {% endif %}
+                        {% endfor %}
+                        ,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY {% for col in columns if col.isBusinessKey %}
+                                {{ get_source_transform(source.columns | selectattr("name", "equalto", col.name) | first) }}
+                                {%- if not loop.last -%}, {% endif %}
+                            {% endfor %}
+                            ORDER BY {{ get_source_transform(source.columns | selectattr("name", "equalto", load_date_col) | first) }} DESC
+                        ) AS rn
+                    {{ source.join }}
+                    {% if config.insertStrategy in ['UNION', 'UNION ALL'] and not loop.last %}
+                        {{ config.insertStrategy }}
+                    {% endif %}
+                {% endfor %}
+            ) branch_src
+            WHERE branch_src.rn = 1
+        ) combined_src
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY {% for col in columns if col.isBusinessKey %}
+                combined_src."{{ col.name }}"
+                {%- if not loop.last %}, {% endif %}
+            {% endfor %}
+            ORDER BY combined_src."{{ load_date_col }}" DESC
+        ) = 1
+    {% else %}
+        SELECT * FROM (
+            {% for source in sources %}
+                SELECT
+                    {% for col in source.columns %}
+                        {{ get_source_transform(col) }} AS "{{ col.name }}"
+                        {%- if not loop.last %}, {% endif %}
+                    {% endfor %}
+                {{ source.join }}
+                {% if config.insertStrategy in ['UNION', 'UNION ALL'] and not loop.last %}
+                    {{ config.insertStrategy }}
+                {% endif %}
+            {% endfor %}
+        ) src
+    {% endif %};
+{% endif %}
