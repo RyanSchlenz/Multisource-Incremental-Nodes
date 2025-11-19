@@ -1,0 +1,85 @@
+capitalized: MultiSource Incremental Fact
+short: MSINCFCT
+tagColor: '#FF69B4'
+plural: MultiSource Incremental Facts
+
+config:
+  
+- groupName: Incremental Options
+  items:
+  - type: materializationSelector
+    isRequired: true
+    options:
+    - table
+
+  - type: multisourceToggle
+    enableIf: "{% if node.override.create.enabled %} false {% else %} true {% endif %}"
+  - displayName: Multi Source Strategy
+    attributeName: insertStrategy
+    type: dropdownSelector
+    default: UNION ALL
+    options:
+    - "UNION"
+    - "UNION ALL"
+    isRequired: false
+    enableIf: "{% if node.isMultisource %} true {% else %} false {% endif %}"
+
+  - displayName: Enable Incremental Loading
+    attributeName: enableIncremental
+    type: toggleButton
+    default: true
+
+  - displayName: Initial Full Load Mode
+    attributeName: isInitialLoad
+    type: toggleButton
+    default: false
+    isRequired: false
+    enableIf: "{% if config.enableIncremental %} true {% else %} false {% endif %}"
+
+  - displayName: Load Date Column
+    attributeName: loadDateColumn
+    type: columnDropdownSelector
+    isRequired: true
+    enableIf: "{% if config.enableIncremental %} true {% else %} false {% endif %}"
+
+  - displayName: Lookback Days
+    attributeName: lookbackDays
+    type: dropdownSelector
+    default: "1"
+    options:
+    - "1"
+    - "2"
+    - "3"
+    - "7"
+    - "14"
+    - "30"
+    - "90"
+    isRequired: true
+    enableIf: "{% if config.enableIncremental and not config.isInitialLoad %} true {% else %} false {% endif %}"
+
+  - type: businessKeyColumns
+    isRequired: false
+
+  - displayName: Enable Tests
+    attributeName: testsEnabled
+    type: toggleButton
+    default: false
+
+  - displayName: Pre-SQL
+    attributeName: preSQL
+    type: textBox
+    syntax: sql
+    isRequired: false
+
+  - displayName: Post-SQL
+    attributeName: postSQL
+    type: textBox
+    syntax: sql
+    isRequired: false
+
+systemColumns:
+- displayName: LOAD_TIMESTAMP
+  transform: CAST(CURRENT_TIMESTAMP AS TIMESTAMP)
+  dataType: TIMESTAMP
+  placement: end
+  attributeName: isSystemLoadTimestamp
