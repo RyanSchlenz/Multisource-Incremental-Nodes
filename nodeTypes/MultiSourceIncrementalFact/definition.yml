@@ -29,36 +29,25 @@ config:
     type: toggleButton
     default: true
 
-  - displayName: Initial Full Load Mode
-    attributeName: isInitialLoad
-    type: toggleButton
-    default: false
-    isRequired: false
-    enableIf: "{% if config.enableIncremental %} true {% else %} false {% endif %}"
-
   - displayName: Load Date Column
     attributeName: loadDateColumn
     type: columnDropdownSelector
     isRequired: true
     enableIf: "{% if config.enableIncremental %} true {% else %} false {% endif %}"
 
-  - displayName: Lookback Days
-    attributeName: lookbackDays
-    type: dropdownSelector
-    default: "1"
-    options:
-    - "1"
-    - "2"
-    - "3"
-    - "7"
-    - "14"
-    - "30"
-    - "90"
-    isRequired: true
-    enableIf: "{% if config.enableIncremental and not config.isInitialLoad %} true {% else %} false {% endif %}"
-
   - type: businessKeyColumns
     isRequired: false
+
+  - displayName: Enable Soft Delete Handling
+    attributeName: enableSoftDelete
+    type: toggleButton
+    default: false
+
+  - displayName: Soft Delete Column
+    attributeName: softDeleteColumn
+    type: columnDropdownSelector
+    isRequired: true
+    enableIf: "{% if config.enableSoftDelete %} true {% else %} false {% endif %}"
 
   - displayName: Enable Tests
     attributeName: testsEnabled
