@@ -1,6 +1,13 @@
 {# ======================================================== #}
-{# Incremental Fact Node - Run Template (with Multi-Source) #}
+{# MultiSource Incremental Fact - Run Template              #}
+{# No template-level deduplication. If duplicates exist in  #}
+{# source, the MERGE will fail loudly. Fix upstream.        #}
 {# ======================================================== #}
+
+{% set target_table = ref_no_link(node.location.name, node.name) %}
+{% set load_date_col = config.loadDateColumn.name if config.loadDateColumn.name is defined else config.loadDateColumn %}
+{% set has_business_key = columns | selectattr("isBusinessKey") | list | length > 0 %}
+{% set soft_delete_col = config.softDeleteColumn.name if config.softDeleteColumn is defined and config.softDeleteColumn.name is defined else (config.softDeleteColumn if config.softDeleteColumn is defined else '') %}
 
 {# Run tests before insertion #}
 {% for test in node.tests if config.testsEnabled %}
@@ -16,59 +23,63 @@
     {{ config.preSQL }}
 {% endif %}
 
-{% set load_date_col = config.loadDateColumn.name if config.loadDateColumn.name is defined else config.loadDateColumn %}
-{% set has_business_key = columns | selectattr("isBusinessKey") | list | length > 0 %}
-
 {# ========================================================= #}
-{# INCREMENTAL LOAD (MERGE or INSERT)                       #}
+{# INCREMENTAL LOAD (MERGE or INSERT)                        #}
 {# ========================================================= #}
 
 {% if config.enableIncremental and has_business_key %}
+    {# ---------------------------------------------------- #}
+    {# MERGE: Incremental with business keys                 #}
+    {# Auto-detects empty table for initial full load        #}
+    {# 3-day lookback from MAX(load_date) in target          #}
+    {# ---------------------------------------------------- #}
     {{ stage('MERGE Incremental Data') }}
-    MERGE INTO {{ ref_no_link(node.location.name, node.name) }} "TGT"
+    MERGE INTO {{ target_table }} "TGT"
     USING (
-        SELECT * EXCLUDE (rn) FROM (
-            SELECT *
-            FROM (
-                {% for source in sources %}
-                    SELECT
-                        {% for col in source.columns %}
-                            {{ get_source_transform(col) }} AS "{{ col.name }}"
-                            {%- if not loop.last %}, {% endif %}
-                        {% endfor %}
-                        ,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY {% for col in columns if col.isBusinessKey %}
-                                {{ get_source_transform(source.columns | selectattr("name", "equalto", col.name) | first) }}
-                                {%- if not loop.last -%}, {% endif %}
-                            {% endfor %}
-                            ORDER BY {{ get_source_transform(source.columns | selectattr("name", "equalto", load_date_col) | first) }} DESC
-                        ) AS rn
-                    {{ source.join }}
-                    {% if config.insertStrategy in ['UNION', 'UNION ALL'] and not loop.last %}
-                        {{ config.insertStrategy }}
-                    {% endif %}
-                {% endfor %}
-            ) branch_src
-            WHERE branch_src.rn = 1
-        ) combined_src
-        {% if not config.isInitialLoad %}
-            WHERE combined_src."{{ load_date_col }}" >= DATEADD(day, -{{ config.lookbackDays }}, CURRENT_DATE)
-        {% endif %}
-        {% if has_business_key %}
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY {% for col in columns if col.isBusinessKey %}
-                    combined_src."{{ col.name }}"
-                    {%- if not loop.last %}, {% endif %}
-                {% endfor %}
-                ORDER BY combined_src."{{ load_date_col }}" DESC
-            ) = 1
-        {% endif %}
+        SELECT *
+        FROM (
+            {% for source in sources %}
+                SELECT
+                    {% for col in source.columns %}
+                        {{ get_source_transform(col) }} AS "{{ col.name }}"
+                        {%- if not loop.last %}, {% endif %}
+                    {% endfor %}
+                {{ source.join }}
+                {% if config.insertStrategy in ['UNION', 'UNION ALL'] and not loop.last %}
+                    {{ config.insertStrategy }}
+                {% endif %}
+            {% endfor %}
+        ) src
+        WHERE src."{{ load_date_col }}" >= COALESCE(
+            DATEADD(day, -3,
+                (SELECT MAX("{{ load_date_col }}") FROM {{ target_table }})),
+            '1900-01-01'::TIMESTAMP
+        )
     ) "SRC"
     ON {% for col in columns if col.isBusinessKey %}
         {% if not loop.first %}AND {% endif %}
         "SRC"."{{ col.name }}" = "TGT"."{{ col.name }}"
     {% endfor %}
+    {% if config.enableSoftDelete %}
+    WHEN MATCHED AND "SRC"."{{ soft_delete_col }}" = TRUE THEN DELETE
+    WHEN MATCHED AND COALESCE("SRC"."{{ soft_delete_col }}", FALSE) = FALSE THEN UPDATE SET
+        {%- for col in columns if not col.isBusinessKey and col.name != soft_delete_col %}
+            "TGT"."{{ col.name }}" = "SRC"."{{ col.name }}"
+            {% if not loop.last %}, {% endif %}
+        {% endfor %}
+    WHEN NOT MATCHED AND COALESCE("SRC"."{{ soft_delete_col }}", FALSE) = FALSE THEN INSERT (
+        {%- for col in columns if col.name != soft_delete_col %}
+            "{{ col.name }}"
+            {% if not loop.last %}, {% endif %}
+        {% endfor -%}
+    )
+    VALUES (
+        {%- for col in columns if col.name != soft_delete_col %}
+            "SRC"."{{ col.name }}"
+            {% if not loop.last %}, {% endif %}
+        {% endfor -%}
+    );
+    {% else %}
     WHEN MATCHED THEN UPDATE SET
         {%- for col in columns if not col.isBusinessKey %}
             "TGT"."{{ col.name }}" = "SRC"."{{ col.name }}"
@@ -86,103 +97,95 @@
             {% if not loop.last %}, {% endif %}
         {% endfor -%}
     );
+    {% endif %}
 
 {% elif config.enableIncremental %}
+    {# ---------------------------------------------------- #}
+    {# INSERT: Incremental without business keys (append)    #}
+    {# ---------------------------------------------------- #}
     {{ stage('Insert Incremental (No Business Key)') }}
-    INSERT INTO {{ ref_no_link(node.location.name, node.name) }}
+    INSERT INTO {{ target_table }}
     (
-        {% for col in columns %}
+        {% for col in columns if not (config.enableSoftDelete and col.name == soft_delete_col) %}
             "{{ col.name }}"
             {%- if not loop.last %}, {% endif %}
         {% endfor %}
     )
-    SELECT *
+    SELECT
+        {% for col in columns if not (config.enableSoftDelete and col.name == soft_delete_col) %}
+            src."{{ col.name }}"
+            {%- if not loop.last %}, {% endif %}
+        {% endfor %}
     FROM (
-        SELECT *
-        FROM (
-            {% for source in sources %}
-                SELECT
-                    {% for col in source.columns %}
-                        {{ get_source_transform(col) }} AS "{{ col.name }}"
-                        {%- if not loop.last %}, {% endif %}
-                    {% endfor %}
-                {{ source.join }}
-                {% if config.insertStrategy in ['UNION', 'UNION ALL'] and not loop.last %}
-                    {{ config.insertStrategy }}
-                {% endif %}
-            {% endfor %}
-        ) branch_src
-        {% if has_business_key %}
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY {% for col in columns if col.isBusinessKey %}
-                    branch_src."{{ col.name }}"
+        {% for source in sources %}
+            SELECT
+                {% for col in source.columns %}
+                    {{ get_source_transform(col) }} AS "{{ col.name }}"
                     {%- if not loop.last %}, {% endif %}
                 {% endfor %}
-                ORDER BY branch_src."{{ load_date_col }}" DESC
-            ) = 1
-        {% endif %}
+            {{ source.join }}
+            {% if config.insertStrategy in ['UNION', 'UNION ALL'] and not loop.last %}
+                {{ config.insertStrategy }}
+            {% endif %}
+        {% endfor %}
     ) src
-    WHERE src."{{ load_date_col }}" >= DATEADD(day, -{{ config.lookbackDays }}, CURRENT_DATE);
+    WHERE src."{{ load_date_col }}" >= COALESCE(
+        DATEADD(day, -3,
+            (SELECT MAX("{{ load_date_col }}") FROM {{ target_table }})),
+        '1900-01-01'::TIMESTAMP
+    )
+    {% if config.enableSoftDelete %}
+        AND COALESCE(src."{{ soft_delete_col }}", FALSE) = FALSE
+    {% endif %};
 
 {% else %}
+    {# ---------------------------------------------------- #}
+    {# FULL LOAD: Truncate and reload                        #}
+    {# ---------------------------------------------------- #}
     {{ stage('Truncate Table') }}
-    TRUNCATE TABLE {{ ref_no_link(node.location.name, node.name) }};
+    TRUNCATE TABLE {{ target_table }};
 
     {{ stage('Insert Full Data') }}
-    INSERT INTO {{ ref_no_link(node.location.name, node.name) }}
+    INSERT INTO {{ target_table }}
     (
-        {% for col in columns %}
+        {% for col in columns if not (config.enableSoftDelete and col.name == soft_delete_col) %}
             "{{ col.name }}"
             {%- if not loop.last %}, {% endif %}
         {% endfor %}
     )
-    {% if has_business_key %}
-        SELECT * EXCLUDE (rn)
-        FROM (
-            SELECT *
-            FROM (
-                {% for source in sources %}
-                    SELECT
-                        {% for col in source.columns %}
-                            {{ get_source_transform(col) }} AS "{{ col.name }}"
-                            {%- if not loop.last %}, {% endif %}
-                        {% endfor %}
-                        ,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY {% for col in columns if col.isBusinessKey %}
-                                {{ get_source_transform(source.columns | selectattr("name", "equalto", col.name) | first) }}
-                                {%- if not loop.last -%}, {% endif %}
-                            {% endfor %}
-                            ORDER BY {{ get_source_transform(source.columns | selectattr("name", "equalto", load_date_col) | first) }} DESC
-                        ) AS rn
-                    {{ source.join }}
-                    {% if config.insertStrategy in ['UNION', 'UNION ALL'] and not loop.last %}
-                        {{ config.insertStrategy }}
-                    {% endif %}
+    SELECT
+        {% for col in columns if not (config.enableSoftDelete and col.name == soft_delete_col) %}
+            src."{{ col.name }}"
+            {%- if not loop.last %}, {% endif %}
+        {% endfor %}
+    FROM (
+        {% for source in sources %}
+            SELECT
+                {% for col in source.columns %}
+                    {{ get_source_transform(col) }} AS "{{ col.name }}"
+                    {%- if not loop.last %}, {% endif %}
                 {% endfor %}
-            ) branch_src
-            WHERE branch_src.rn = 1
-        ) combined_src
-        QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY {% for col in columns if col.isBusinessKey %}
-                combined_src."{{ col.name }}"
-                {%- if not loop.last %}, {% endif %}
-            {% endfor %}
-            ORDER BY combined_src."{{ load_date_col }}" DESC
-        ) = 1
-    {% else %}
-        SELECT * FROM (
-            {% for source in sources %}
-                SELECT
-                    {% for col in source.columns %}
-                        {{ get_source_transform(col) }} AS "{{ col.name }}"
-                        {%- if not loop.last %}, {% endif %}
-                    {% endfor %}
-                {{ source.join }}
-                {% if config.insertStrategy in ['UNION', 'UNION ALL'] and not loop.last %}
-                    {{ config.insertStrategy }}
-                {% endif %}
-            {% endfor %}
-        ) src
+            {{ source.join }}
+            {% if config.insertStrategy in ['UNION', 'UNION ALL'] and not loop.last %}
+                {{ config.insertStrategy }}
+            {% endif %}
+        {% endfor %}
+    ) src
+    {% if config.enableSoftDelete %}
+        WHERE COALESCE(src."{{ soft_delete_col }}", FALSE) = FALSE
     {% endif %};
 {% endif %}
+
+{# Post-SQL #}
+{% if config.postSQL %}
+    {{ stage('Post-SQL') }}
+    {{ config.postSQL }}
+{% endif %}
+
+{# Run tests after insertion #}
+{% for test in node.tests if config.testsEnabled %}
+    {% if test.runOrder == 'After' %}
+        {{ test_stage(test.name, test.continueOnFailure) }}
+        {{ test.templateString }}
+    {% endif %}
+{% endfor %}
